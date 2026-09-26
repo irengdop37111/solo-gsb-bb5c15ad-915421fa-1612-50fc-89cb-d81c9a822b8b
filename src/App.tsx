@@ -2,10 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Timeline from './components/Timeline';
 import CueTable from './components/CueTable';
 import ImportModal from './components/ImportModal';
+import RemapModal from './components/RemapModal';
 import VideoPlayer from './components/VideoPlayer';
 import { useUndoable } from './hooks/useUndoable';
 import { parseVtt, serializeVtt } from './lib/vtt';
 import { applyEdit } from './lib/engine';
+import { applyRemap, type Anchor } from './lib/remap';
 import { MIN_DURATION, formatTimestamp } from './lib/time';
 import type { Cue } from './types';
 
@@ -19,6 +21,7 @@ export default function App() {
   const { present: cues, commit, reset, undo, redo, canUndo, canRedo, beginBatch, updateBatch, endBatch } = history;
 
   const [showImport, setShowImport] = useState(true);
+  const [showRemap, setShowRemap] = useState(false);
   const [chainMode, setChainMode] = useState(true);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [playhead, setPlayhead] = useState(0);
@@ -178,6 +181,17 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [undo, redo]);
 
+  // ---------- 剪辑版本时间映射 ----------
+  const applyVersionRemap = useCallback(
+    (anchors: Anchor[]) => {
+      // 一次性替换全部字幕时间（保留 id/文本），只产生一条撤销记录
+      commit((prev) => applyRemap(prev, anchors));
+      setShowRemap(false);
+      flash('已应用剪辑版本时间映射');
+    },
+    [commit, flash],
+  );
+
   // ---------- 导出 ----------
   const exportVtt = useCallback(() => {
     const content = serializeVtt(cues);
@@ -230,6 +244,10 @@ export default function App() {
             />
             <span>连锁模式</span>
           </label>
+          <span className="divider" />
+          <button className="btn" onClick={() => setShowRemap(true)} disabled={cues.length === 0}>
+            版本映射
+          </button>
           <span className="divider" />
           <button className="btn" onClick={copyVtt} disabled={cues.length === 0}>
             复制
@@ -300,6 +318,13 @@ export default function App() {
         <ImportModal
           onClose={() => setShowImport(false)}
           onImport={handleImport}
+        />
+      )}
+      {showRemap && (
+        <RemapModal
+          cues={cues}
+          onClose={() => setShowRemap(false)}
+          onApply={applyVersionRemap}
         />
       )}
       {toast && <div className="toast">{toast}</div>}

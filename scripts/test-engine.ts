@@ -3,6 +3,7 @@ import type { Cue } from '../src/types';
 import { applyEdit, computeSnap, assertInvariants } from '../src/lib/engine';
 import { parseVtt, serializeVtt } from '../src/lib/vtt';
 import { parseTimestamp, formatTimestamp, MIN_DURATION, SNAP_DISTANCE } from '../src/lib/time';
+import { validateAnchors, mapTime, previewRemap, applyRemap } from '../src/lib/remap';
 
 let passed = 0;
 function test(name: string, fn: () => void) {
@@ -276,6 +277,140 @@ test('时间戳解析/格式化', () => {
   assert.equal(parseTimestamp('01:02:03.004'), 3723.004);
   assert.equal(parseTimestamp('bad'), null);
   assert.equal(formatTimestamp(3723.004), '01:02:03.004');
+});
+
+// ---------- 剪辑版本时间映射 ----------
+test('锚点校验：少于两组或任一侧非严格递增都被拒绝', () => {
+  assert(validateAnchors([]) !== null);
+  assert(validateAnchors([{ oldTime: 1, newTime: 1 }]) !== null);
+  // 旧版时间不递增
+  assert(validateAnchors([
+    { oldTime: 1, newTime: 1 },
+    { oldTime: 1, newTime: 2 },
+  ]) !== null);
+  assert(validateAnchors([
+    { oldTime: 2, newTime: 1 },
+    { oldTime: 1, newTime: 2 },
+  ]) !== null);
+  // 新版时间不递增
+  assert(validateAnchors([
+    { oldTime: 1, newTime: 2 },
+    { oldTime: 2, newTime: 2 },
+  ]) !== null);
+  // 合法
+  assert(validateAnchors([
+    { oldTime: 1, newTime: 1 },
+    { oldTime: 2, newTime: 2 },
+  ]) === null);
+});
+
+test('分段线性映射：锚点精确命中，段内线性插值', () => {
+  const anchors = [
+    { oldTime: 10, newTime: 20 },
+    { oldTime: 20, newTime: 40 },
+    { oldTime: 40, newTime: 50 },
+  ];
+  assert.equal(mapTime(anchors, 10), 20);
+  assert.equal(mapTime(anchors, 20), 40);
+  assert.equal(mapTime(anchors, 40), 50);
+  assert.equal(mapTime(anchors, 15), 30); // 第一段斜率 2
+  assert.equal(mapTime(anchors, 30), 45); // 第二段斜率 0.5
+});
+
+test('区间外按最近一段斜率外推', () => {
+  const anchors = [
+    { oldTime: 10, newTime: 20 },
+    { oldTime: 20, newTime: 40 },
+    { oldTime: 40, newTime: 50 },
+  ];
+  assert.equal(mapTime(anchors, 0), 0); // 首段斜率 2 向左外推
+  assert.equal(mapTime(anchors, 5), 10);
+  assert.equal(mapTime(anchors, 50), 55); // 末段斜率 0.5 向右外推
+});
+
+test('预览标出负起点 / 时长不足 300ms / 相邻重叠，且禁止应用', () => {
+  const cues = mkCues([
+    [0, 1],
+    [2, 3],
+    [4, 5],
+  ]);
+  // 斜率 0.1：1s 时长被压成 0.1s → 时长不足
+  const compressed = previewRemap(cues, [
+    { oldTime: 0, newTime: 10 },
+    { oldTime: 10, newTime: 11 },
+  ]);
+  assert(!compressed.ok);
+  assert(compressed.issues.every((i) => i.kind === 'short-duration'));
+  assert(compressed.rows.every((r) => r.issues.includes('short-duration')));
+
+  // 首段外推到负区间 → 负起点
+  const negative = previewRemap(mkCues([[0, 1]]), [
+    { oldTime: 10, newTime: 0 },
+    { oldTime: 20, newTime: 10 },
+  ]);
+  assert(!negative.ok);
+  assert(negative.issues.some((i) => i.kind === 'negative-start'));
+
+  // 输入本身重叠（恒等映射）→ 重叠的两条都被标出
+  const overlapping = previewRemap(
+    mkCues([
+      [0, 2],
+      [1, 3],
+    ]),
+    [
+      { oldTime: 0, newTime: 0 },
+      { oldTime: 10, newTime: 10 },
+    ],
+  );
+  assert(!overlapping.ok);
+  assert(overlapping.rows[0].issues.includes('overlap'));
+  assert(overlapping.rows[1].issues.includes('overlap'));
+
+  // 预览未通过时 applyRemap 原样返回（不产生新数组）
+  assert.equal(applyRemap(cues, [
+    { oldTime: 0, newTime: 10 },
+    { oldTime: 10, newTime: 11 },
+  ]), cues);
+});
+
+test('应用映射：一次性替换时间，保留 id 与文本，结果满足不变量', () => {
+  const cues = mkCues([
+    [0, 1],
+    [2, 4],
+  ]);
+  const anchors = [
+    { oldTime: 0, newTime: 5 },
+    { oldTime: 4, newTime: 9 },
+  ];
+  const next = applyRemap(cues, anchors);
+  assert.equal(next.length, 2);
+  // id / 文本保留
+  assert.equal(next[0].id, cues[0].id);
+  assert.equal(next[0].text, cues[0].text);
+  assert.equal(next[1].id, cues[1].id);
+  // 时间被替换：斜率 1，整体平移 +5
+  assert.equal(next[0].start, 5);
+  assert.equal(next[0].end, 6);
+  assert.equal(next[1].start, 7);
+  assert.equal(next[1].end, 9);
+  expectValid(next);
+  // 原数组未被修改
+  assert.equal(cues[0].start, 0);
+});
+
+test('映射结果可序列化往返', () => {
+  const cues = mkCues([
+    [1, 2.5],
+    [3, 4],
+  ]);
+  const next = applyRemap(cues, [
+    { oldTime: 0, newTime: 2 },
+    { oldTime: 10, newTime: 20 },
+  ]);
+  const reparsed = parseVtt(serializeVtt(next));
+  assert.equal(reparsed.length, 2);
+  assert(Math.abs(reparsed[0].start - next[0].start) < 1e-3);
+  assert(Math.abs(reparsed[1].end - next[1].end) < 1e-3);
 });
 
 console.log(`\n全部 ${passed} 个测试通过 ✅`);
