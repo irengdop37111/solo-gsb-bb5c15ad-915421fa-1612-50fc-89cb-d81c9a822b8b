@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Timeline from './components/Timeline';
 import CueTable from './components/CueTable';
 import ImportModal from './components/ImportModal';
+import RemapModal from './components/RemapModal';
 import VideoPlayer from './components/VideoPlayer';
 import { useUndoable } from './hooks/useUndoable';
 import { parseVtt, serializeVtt } from './lib/vtt';
@@ -19,6 +20,7 @@ export default function App() {
   const { present: cues, commit, reset, undo, redo, canUndo, canRedo, beginBatch, updateBatch, endBatch } = history;
 
   const [showImport, setShowImport] = useState(true);
+  const [showRemap, setShowRemap] = useState(false);
   const [chainMode, setChainMode] = useState(true);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [playhead, setPlayhead] = useState(0);
@@ -200,6 +202,16 @@ export default function App() {
     }
   }, [cues, flash]);
 
+  // ---------- 剪辑版本时间映射：预览通过后一次性替换，单条撤销记录 ----------
+  const applyRemap = useCallback(
+    (next: Cue[]) => {
+      commit(() => next, 'remap-time-anchors');
+      setShowRemap(false);
+      flash(`已按锚点映射 ${next.length} 条字幕时间`);
+    },
+    [commit, flash],
+  );
+
   return (
     <div className="app">
       <header className="topbar">
@@ -213,6 +225,9 @@ export default function App() {
           </button>
           <button className="btn" onClick={loadSample}>
             载入示例
+          </button>
+          <button className="btn" onClick={() => setShowRemap(true)} disabled={cues.length === 0}>
+            时间映射
           </button>
           <span className="divider" />
           <button className="btn icon" onClick={undo} disabled={!canUndo} title="撤销 (Ctrl+Z)">
@@ -300,6 +315,13 @@ export default function App() {
         <ImportModal
           onClose={() => setShowImport(false)}
           onImport={handleImport}
+        />
+      )}
+      {showRemap && (
+        <RemapModal
+          cues={cues}
+          onClose={() => setShowRemap(false)}
+          onApply={applyRemap}
         />
       )}
       {toast && <div className="toast">{toast}</div>}

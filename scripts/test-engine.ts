@@ -3,6 +3,7 @@ import type { Cue } from '../src/types';
 import { applyEdit, computeSnap, assertInvariants } from '../src/lib/engine';
 import { parseVtt, serializeVtt } from '../src/lib/vtt';
 import { parseTimestamp, formatTimestamp, MIN_DURATION, SNAP_DISTANCE } from '../src/lib/time';
+import { validateAnchors, buildMapper, remapCues, previewRemap } from '../src/lib/remap';
 
 let passed = 0;
 function test(name: string, fn: () => void) {
@@ -276,6 +277,190 @@ test('时间戳解析/格式化', () => {
   assert.equal(parseTimestamp('01:02:03.004'), 3723.004);
   assert.equal(parseTimestamp('bad'), null);
   assert.equal(formatTimestamp(3723.004), '01:02:03.004');
+});
+
+// ---------- 剪辑版本时间映射 ----------
+test('锚点：少于两组无效', () => {
+  assert.equal(validateAnchors([])?.code, 'empty');
+  assert.equal(validateAnchors([{ oldT: 0, newT: 0 }])?.code, 'too-few');
+});
+
+test('锚点：旧版/新版时间必须严格递增（相等也算违规）', () => {
+  const oldBad = validateAnchors([
+    { oldT: 0, newT: 1 },
+    { oldT: 0, newT: 2 },
+  ]);
+  assert.equal(oldBad?.code, 'old-not-strict');
+  assert.deepEqual(oldBad?.rows, [0, 1]);
+
+  const newBad = validateAnchors([
+    { oldT: 0, newT: 5 },
+    { oldT: 1, newT: 5 },
+    { oldT: 2, newT: 6 },
+  ]);
+  assert.equal(newBad?.code, 'new-not-strict');
+  assert.deepEqual(newBad?.rows, [0, 1]);
+
+  // 倒退
+  assert.equal(
+    validateAnchors([
+      { oldT: 2, newT: 1 },
+      { oldT: 1, newT: 2 },
+    ])?.code,
+    'old-not-strict',
+  );
+
+  assert.equal(
+    validateAnchors([
+      { oldT: 0, newT: 0 },
+      { oldT: 1, newT: 2 },
+    ]),
+    null,
+  );
+});
+
+test('分段线性映射：锚点精确命中 + 区间内插值', () => {
+  // 0→0, 10→20（段内斜率 2）
+  const map = buildMapper([
+    { oldT: 0, newT: 0 },
+    { oldT: 10, newT: 20 },
+  ]);
+  assert.equal(map(0), 0);
+  assert.equal(map(10), 20);
+  assert.equal(map(5), 10);
+});
+
+test('多段映射：各段使用各自斜率', () => {
+  // 0→0（斜率 1 到 10→10），再 10→10 到 20→30（斜率 2）
+  const map = buildMapper([
+    { oldT: 0, newT: 0 },
+    { oldT: 10, newT: 10 },
+    { oldT: 20, newT: 30 },
+  ]);
+  assert.equal(map(5), 5);
+  assert.equal(map(10), 10);
+  assert.equal(map(15), 20);
+  assert.equal(map(20), 30);
+});
+
+test('区间外按最近一段斜率外推（首段/末段）', () => {
+  // 首段 0→0, 10→20 斜率 2；末段 10→20, 20→25 斜率 0.5
+  const map = buildMapper([
+    { oldT: 0, newT: 0 },
+    { oldT: 10, newT: 20 },
+    { oldT: 20, newT: 25 },
+  ]);
+  assert.equal(map(-5), -10); // 首段外推
+  assert.equal(map(30), 30); // 末段外推 25 + 0.5*10
+});
+
+test('remapCues：时间被映射，文本与 id 原样保留', () => {
+  const cues = mkCues([
+    [0, 1],
+    [2, 4],
+  ]);
+  cues[0].text = '保持文本A';
+  const next = remapCues(cues, [
+    { oldT: 0, newT: 10 },
+    { oldT: 4, newT: 30 },
+  ]);
+  assert.equal(next[0].id, 'c0');
+  assert.equal(next[0].text, '保持文本A');
+  assert.equal(next[1].id, 'c1');
+  // 0→10；1→15；2→20；4→30
+  assert.equal(next[0].start, 10);
+  assert.equal(next[0].end, 15);
+  assert.equal(next[1].start, 20);
+  assert.equal(next[1].end, 30);
+});
+
+test('预览通过：合法映射 valid=true，无受影响字幕', () => {
+  const cues = mkCues([
+    [0, 1],
+    [2, 4],
+  ]);
+  const preview = previewRemap(cues, [
+    { oldT: 0, newT: 0 },
+    { oldT: 4, newT: 8 },
+  ]);
+  assert.equal(preview.valid, true);
+  assert.equal(preview.affectedIds.size, 0);
+});
+
+test('预览拦截：外推出负起点', () => {
+  const cues = mkCues([
+    [0, 1],
+    [2, 4],
+  ]);
+  // 锚点区间从 10 开始，首段斜率 1：字幕 0→-10
+  const preview = previewRemap(
+    cues,
+    [
+      { oldT: 10, newT: 0 },
+      { oldT: 20, newT: 10 },
+    ],
+  );
+  assert.equal(preview.valid, false);
+  assert.ok(preview.affectedIds.has('c0'));
+  assert.ok(preview.issues.some((i) => i.code === 'negative-start'));
+});
+
+test('预览拦截：压缩导致时长不足 300ms', () => {
+  const cues = mkCues([
+    [0, 1],
+    [2, 4],
+  ]);
+  // 0→0，4→0.4：斜率 0.1，第一条时长 100ms
+  const preview = previewRemap(cues, [
+    { oldT: 0, newT: 0 },
+    { oldT: 4, newT: 0.4 },
+  ]);
+  assert.equal(preview.valid, false);
+  assert.ok(preview.issues.some((i) => i.code === 'too-short' && i.cueId === 'c0'));
+});
+
+test('预览拦截：非单调输入中的相邻重叠也会被标出', () => {
+  // 正常严格递增锚点不会制造重叠；但输入本身重叠时必须被发现
+  const cues = mkCues([
+    [0, 3],
+    [2, 4],
+  ]);
+  const preview = previewRemap(cues, [
+    { oldT: 0, newT: 0 },
+    { oldT: 4, newT: 8 },
+  ]);
+  assert.equal(preview.valid, false);
+  const overlap = preview.issues.filter((i) => i.code === 'overlap');
+  assert.equal(overlap.length, 2);
+  assert.ok(preview.affectedIds.has('c0'));
+  assert.ok(preview.affectedIds.has('c1'));
+});
+
+test('外推标记：区间外的起点/终点被标记', () => {
+  const cues = mkCues([[0, 30]]);
+  const preview = previewRemap(cues, [
+    { oldT: 5, newT: 5 },
+    { oldT: 10, newT: 20 },
+  ]);
+  const rc = preview.cues[0];
+  assert.equal(rc.extrapolatedStart, true);
+  assert.equal(rc.extrapolatedEnd, true);
+});
+
+test('映射后仍满足引擎不变量（当预览通过时）', () => {
+  const cues = mkCues([
+    [0.5, 3],
+    [3.2, 6],
+    [6.3, 9.5],
+  ]);
+  const anchors = [
+    { oldT: 0, newT: 2 },
+    { oldT: 10, newT: 25 },
+  ];
+  const preview = previewRemap(cues, anchors);
+  assert.equal(preview.valid, true);
+  const next = remapCues(cues, anchors);
+  expectValid(next);
 });
 
 console.log(`\n全部 ${passed} 个测试通过 ✅`);
